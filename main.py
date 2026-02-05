@@ -7,8 +7,8 @@ from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                              QHBoxLayout, QPushButton, QScrollArea, QColorDialog, 
                              QLabel, QMessageBox, QFrame, QFileDialog, QProgressDialog,
                              QSlider) 
-from PyQt5.QtGui import QPainter, QPen, QPixmap, QPalette, QColor, QCursor, QIcon, QImage
-from PyQt5.QtCore import Qt, QPoint, QRect, QSize, pyqtSignal
+from PyQt5.QtGui import QPainter, QPen, QPixmap, QPalette, QColor, QCursor, QIcon, QImage, QFont
+from PyQt5.QtCore import Qt, QPoint, QRect, QSize, pyqtSignal, QBuffer, QByteArray, QIODevice
 from PyQt5.QtPrintSupport import QPrinter
 
 # --- OPTIONAL IMPORTS ---
@@ -28,12 +28,89 @@ VIEW_SCALE = 2
 VIEW_WIDTH = IMG_WIDTH // VIEW_SCALE
 VIEW_HEIGHT = IMG_HEIGHT // VIEW_SCALE
 
-UNDO_LIMIT = 5
+# Keep Undo limit at 5 (Smart Undo will keep RAM usage efficient)
+UNDO_LIMIT = 5 
+
+class Page:
+    """
+    Represents a single A4 page.
+    """
+    def __init__(self, pixmap=None):
+        if pixmap:
+            self.high_res_pixmap = pixmap
+        else:
+            self.high_res_pixmap = QPixmap(IMG_WIDTH, IMG_HEIGHT)
+            self.high_res_pixmap.fill(Qt.white)
+            
+        self.compressed_data = None
+        self.preview_pixmap = self.high_res_pixmap.scaled(
+            VIEW_WIDTH, VIEW_HEIGHT, Qt.KeepAspectRatio, Qt.SmoothTransformation
+        )
+        self.is_compressed = False
+
+    def compress(self):
+        """Converts High Res QPixmap to PNG bytes (Lossless) to save RAM."""
+        if self.is_compressed:
+            return
+
+        # 1. Update preview
+        self.preview_pixmap = self.high_res_pixmap.scaled(
+            VIEW_WIDTH, VIEW_HEIGHT, Qt.KeepAspectRatio, Qt.SmoothTransformation
+        )
+        
+        # Draw "Compressed" Watermark on preview
+        painter = QPainter(self.preview_pixmap)
+        painter.setPen(QPen(Qt.red))
+        font = QFont("Arial", 14, QFont.Bold)
+        painter.setFont(font)
+        rect = self.preview_pixmap.rect().adjusted(0, 5, -5, 0)
+        painter.drawText(rect, Qt.AlignRight | Qt.AlignTop, "Compressed (PNG)")
+        painter.end()
+
+        # 2. Save to PNG (Lossless)
+        ba = QByteArray()
+        buff = QBuffer(ba)
+        buff.open(QIODevice.WriteOnly)
+        self.high_res_pixmap.save(buff, "PNG") 
+        self.compressed_data = ba.data()
+        
+        # 3. Dump heavy object
+        self.high_res_pixmap = None
+        self.is_compressed = True
+
+    def decompress(self):
+        """Restores High Res QPixmap from bytes."""
+        if not self.is_compressed:
+            return
+
+        img = QImage.fromData(self.compressed_data, "PNG")
+        self.high_res_pixmap = QPixmap.fromImage(img)
+        
+        self.compressed_data = None
+        self.is_compressed = False
+
+    def clone(self):
+        """
+        Smart Clone for Undo:
+        If page is compressed (inactive), we SHARE the data reference.
+        We only deep-copy active pages.
+        """
+        new_page = Page()
+        new_page.is_compressed = self.is_compressed
+        
+        if self.is_compressed:
+            # REFERENCE SHARING (Fast & Low RAM)
+            new_page.compressed_data = self.compressed_data
+            new_page.preview_pixmap = self.preview_pixmap # Share preview too
+            new_page.high_res_pixmap = None
+        else:
+            # DEEP COPY (Active page needs its own memory)
+            new_page.high_res_pixmap = self.high_res_pixmap.copy()
+            new_page.preview_pixmap = self.preview_pixmap.copy()
+            
+        return new_page
 
 class SnippingTool(QWidget):
-    """
-    Fullscreen overlay to capture a specific screen region.
-    """
     snippet_captured = pyqtSignal(QPixmap)
 
     def __init__(self):
@@ -55,12 +132,10 @@ class SnippingTool(QWidget):
     def paintEvent(self, event):
         painter = QPainter(self)
         painter.drawPixmap(0, 0, self.original_pixmap)
-        # Dim screen
         painter.setBrush(QColor(0, 0, 0, 100))
         painter.setPen(Qt.NoPen)
         painter.drawRect(self.rect())
         
-        # Highlight selection
         if self.is_selecting:
             rect = QRect(self.start_point, self.end_point).normalized()
             painter.drawPixmap(rect, self.original_pixmap, rect)
@@ -97,16 +172,15 @@ class SnippingTool(QWidget):
 
 class Canvas(QWidget):
     def __init__(self, parent=None):
-        super().__init__(parent)
+        super().__init__() 
+        self.setParent(parent)
         self.setAttribute(Qt.WA_StaticContents)
         self.setMouseTracking(True)
         
-        # 1. Internal Image is High Res
-        self.image = QPixmap(IMG_WIDTH, IMG_HEIGHT)
-        self.image.fill(Qt.white)
+        self.pages = [Page()] 
+        self.active_page_index = 0
         
-        # 2. Widget Size is Low Res (Screen Size)
-        self.setFixedSize(VIEW_WIDTH, VIEW_HEIGHT)
+        self.update_widget_size()
         
         self.undo_stack = []
         
@@ -114,7 +188,7 @@ class Canvas(QWidget):
         self.last_point_img = QPoint() 
         
         self.current_tool = 'pen' 
-        self.brush_size = 8 # Default thickness
+        self.brush_size = 8 
         self.brush_color = Qt.black
 
         self.select_start_img = QPoint()
@@ -123,48 +197,77 @@ class Canvas(QWidget):
         self.floating_pixmap = None     
         self.floating_pos_img = QPoint()    
 
+    def update_widget_size(self):
+        total_h = len(self.pages) * VIEW_HEIGHT
+        self.setFixedSize(VIEW_WIDTH, total_h)
+
     def to_image_coords(self, pos):
-        """Maps screen coordinates to high-res image coordinates."""
-        return pos * VIEW_SCALE
+        global_x = pos.x() * VIEW_SCALE
+        global_y = pos.y() * VIEW_SCALE
+        return QPoint(global_x, global_y)
+
+    def get_page_at(self, global_y):
+        index = int(global_y // IMG_HEIGHT)
+        local_y = int(global_y % IMG_HEIGHT)
+        if index < 0: index = 0
+        if index >= len(self.pages): index = len(self.pages) - 1
+        return index, local_y
 
     def set_brush_size(self, size):
         self.brush_size = size
 
+    def force_gc(self):
+        """Manually trigger garbage collection."""
+        gc.collect()
+        print("Garbage Collected manually.")
+
     def save_state(self):
         if len(self.undo_stack) >= UNDO_LIMIT:
-            self.undo_stack.pop(0) 
-        self.undo_stack.append(self.image.copy())
+            self.undo_stack.pop(0)
+        
+        # Clone pages (smart clone uses references for compressed pages)
+        snapshot = [p.clone() for p in self.pages]
+        self.undo_stack.append(snapshot)
 
     def undo(self):
         if self.undo_stack:
-            self.image = self.undo_stack.pop()
-            self.setFixedSize(self.image.width() // VIEW_SCALE, self.image.height() // VIEW_SCALE)
+            self.pages = self.undo_stack.pop()
+            
+            # Find active page
+            self.active_page_index = -1
+            for i, p in enumerate(self.pages):
+                if not p.is_compressed:
+                    self.active_page_index = i
+            
+            if self.active_page_index == -1 and self.pages:
+                self.active_page_index = len(self.pages) - 1
+                self.pages[self.active_page_index].decompress()
+
+            self.update_widget_size()
             self.update()
+            gc.collect()
         else:
             print("Nothing to undo")
 
     def reset_to_a4(self):
-        self.save_state()
-        self.image = QPixmap(IMG_WIDTH, IMG_HEIGHT)
-        self.image.fill(Qt.white)
-        self.setFixedSize(VIEW_WIDTH, VIEW_HEIGHT)
+        self.undo_stack.clear()
+        gc.collect()
+        self.pages = [Page()]
+        self.active_page_index = 0
+        self.update_widget_size()
         self.update()
 
     def add_page(self):
         self.save_state()
-        current_w = self.image.width()
-        current_h = self.image.height()
-        new_h = current_h + IMG_HEIGHT 
         
-        new_image = QPixmap(current_w, new_h)
-        new_image.fill(Qt.white)
+        # Compress old active page
+        if 0 <= self.active_page_index < len(self.pages):
+            self.pages[self.active_page_index].compress()
         
-        painter = QPainter(new_image)
-        painter.drawPixmap(0, 0, self.image)
-        painter.end()
+        self.pages.append(Page())
+        self.active_page_index = len(self.pages) - 1
         
-        self.image = new_image
-        self.setFixedSize(current_w // VIEW_SCALE, new_h // VIEW_SCALE)
+        self.update_widget_size()
         self.update()
 
     def set_pen_color(self, color):
@@ -185,9 +288,21 @@ class Canvas(QWidget):
 
     def paste_floating_selection(self):
         if self.floating_pixmap:
-            painter = QPainter(self.image)
-            painter.drawPixmap(self.floating_pos_img, self.floating_pixmap)
+            center_y = self.floating_pos_img.y() + (self.floating_pixmap.height() // 2)
+            page_idx, local_y = self.get_page_at(center_y)
+            
+            if page_idx != self.active_page_index:
+                if 0 <= self.active_page_index < len(self.pages):
+                    self.pages[self.active_page_index].compress()
+                self.pages[page_idx].decompress()
+                self.active_page_index = page_idx
+            
+            page = self.pages[page_idx]
+            painter = QPainter(page.high_res_pixmap)
+            draw_pos = QPoint(self.floating_pos_img.x(), self.floating_pos_img.y() - (page_idx * IMG_HEIGHT))
+            painter.drawPixmap(draw_pos, self.floating_pixmap)
             painter.end()
+            
             self.floating_pixmap = None
             self.update()
 
@@ -195,23 +310,32 @@ class Canvas(QWidget):
         self.paste_floating_selection()
         self.save_state()
         
-        # Scale up screenshot 2x so it looks readable on High Res canvas
         scaled_pixmap = pixmap.scaled(pixmap.width() * 2, pixmap.height() * 2, 
                                       Qt.KeepAspectRatio, Qt.SmoothTransformation)
-        
         self.floating_pixmap = scaled_pixmap
         self.current_tool = 'moving_selection'
-        self.floating_pos_img = QPoint(100, 100) 
+        
+        last_page_y = (len(self.pages) - 1) * IMG_HEIGHT
+        self.floating_pos_img = QPoint(100, last_page_y + 100) 
         self.update()
 
     def mousePressEvent(self, event):
         if event.button() == Qt.LeftButton:
-            img_pos = self.to_image_coords(event.pos())
+            global_pos = self.to_image_coords(event.pos())
             
+            # Check for page switch
+            page_idx, _ = self.get_page_at(global_pos.y())
+            if page_idx != self.active_page_index:
+                if 0 <= self.active_page_index < len(self.pages):
+                    self.pages[self.active_page_index].compress()
+                self.pages[page_idx].decompress()
+                self.active_page_index = page_idx
+                self.update()
+
             if self.current_tool == 'select_box':
                 self.is_selecting = True
-                self.select_start_img = img_pos
-                self.select_current_img = img_pos
+                self.select_start_img = global_pos
+                self.select_current_img = global_pos
 
             elif self.current_tool == 'moving_selection':
                 self.paste_floating_selection()
@@ -220,93 +344,128 @@ class Canvas(QWidget):
             elif self.current_tool in ['pen', 'eraser']:
                 self.save_state()
                 self.drawing = True
-                self.last_point_img = img_pos
+                self.last_point_img = global_pos
 
     def mouseMoveEvent(self, event):
-        img_pos = self.to_image_coords(event.pos())
+        global_pos = self.to_image_coords(event.pos())
 
         if self.current_tool == 'moving_selection' and self.floating_pixmap:
             offset_x = self.floating_pixmap.width() // 2
             offset_y = self.floating_pixmap.height() // 2
-            self.floating_pos_img = img_pos - QPoint(offset_x, offset_y)
+            self.floating_pos_img = global_pos - QPoint(offset_x, offset_y)
             self.update()
             return
 
         if (event.buttons() & Qt.LeftButton):
             if self.current_tool == 'select_box' and self.is_selecting:
-                self.select_current_img = img_pos
+                self.select_current_img = global_pos
                 self.update() 
 
             elif self.current_tool in ['pen', 'eraser'] and self.drawing:
-                painter = QPainter(self.image)
+                page_idx, local_y = self.get_page_at(global_pos.y())
+                page = self.pages[page_idx]
                 
-                if self.current_tool == 'eraser':
-                    # Eraser is 5x the brush size
-                    current_width = self.brush_size * 5
-                    pen = QPen(Qt.white, current_width, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin)
-                else:
-                    pen = QPen(self.brush_color, self.brush_size, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin)
+                if page_idx == self.active_page_index:
+                    prev_page_idx, prev_local_y = self.get_page_at(self.last_point_img.y())
+                    
+                    if prev_page_idx == page_idx:
+                        painter = QPainter(page.high_res_pixmap)
+                        
+                        if self.current_tool == 'eraser':
+                            width = self.brush_size * 5
+                            pen = QPen(Qt.white, width, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin)
+                        else:
+                            pen = QPen(self.brush_color, self.brush_size, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin)
+                        
+                        painter.setPen(pen)
+                        start_pt = QPoint(self.last_point_img.x(), prev_local_y)
+                        end_pt = QPoint(global_pos.x(), local_y)
+                        painter.drawLine(start_pt, end_pt)
+                        painter.end()
                 
-                painter.setPen(pen)
-                painter.drawLine(self.last_point_img, img_pos)
-                painter.end()
-                
-                self.last_point_img = img_pos
+                self.last_point_img = global_pos
                 self.update()
 
     def mouseReleaseEvent(self, event):
         if event.button() == Qt.LeftButton:
-            img_pos = self.to_image_coords(event.pos())
+            global_pos = self.to_image_coords(event.pos())
 
             if self.current_tool == 'select_box' and self.is_selecting:
                 self.is_selecting = False
                 rect = QRect(self.select_start_img, self.select_current_img).normalized()
                 
                 if rect.width() > 10 and rect.height() > 10:
-                    self.save_state()
-                    self.floating_pixmap = self.image.copy(rect)
+                    page_idx, local_y_start = self.get_page_at(rect.top())
                     
-                    painter = QPainter(self.image)
-                    painter.fillRect(rect, Qt.white)
-                    painter.end()
+                    if page_idx != self.active_page_index:
+                         if 0 <= self.active_page_index < len(self.pages):
+                            self.pages[self.active_page_index].compress()
+                         self.pages[page_idx].decompress()
+                         self.active_page_index = page_idx
                     
-                    self.current_tool = 'moving_selection'
-                    offset_x = self.floating_pixmap.width() // 2
-                    offset_y = self.floating_pixmap.height() // 2
-                    self.floating_pos_img = img_pos - QPoint(offset_x, offset_y)
-                    self.update()
+                    page = self.pages[page_idx]
+                    local_rect = QRect(rect.x(), local_y_start, rect.width(), rect.height())
+                    local_rect = local_rect.intersected(QRect(0, 0, IMG_WIDTH, IMG_HEIGHT))
+                    
+                    if not local_rect.isEmpty():
+                        self.save_state()
+                        self.floating_pixmap = page.high_res_pixmap.copy(local_rect)
+                        
+                        painter = QPainter(page.high_res_pixmap)
+                        painter.fillRect(local_rect, Qt.white)
+                        painter.end()
+                        
+                        self.current_tool = 'moving_selection'
+                        offset_x = self.floating_pixmap.width() // 2
+                        offset_y = self.floating_pixmap.height() // 2
+                        self.floating_pos_img = global_pos - QPoint(offset_x, offset_y)
+                        self.update()
 
             elif self.current_tool in ['pen', 'eraser']:
                 self.drawing = False
+                if 0 <= self.active_page_index < len(self.pages):
+                     self.pages[self.active_page_index].preview_pixmap = self.pages[self.active_page_index].high_res_pixmap.scaled(
+                         VIEW_WIDTH, VIEW_HEIGHT, Qt.KeepAspectRatio, Qt.SmoothTransformation
+                     )
 
     def paintEvent(self, event):
         painter = QPainter(self)
-        painter.setRenderHint(QPainter.SmoothPixmapTransform)
+        rect = event.rect()
+        start_page = rect.top() // VIEW_HEIGHT
+        end_page = rect.bottom() // VIEW_HEIGHT
         
-        # Draw Image
-        painter.drawPixmap(self.rect(), self.image)
+        if start_page < 0: start_page = 0
+        if end_page >= len(self.pages): end_page = len(self.pages) - 1
         
-        # Draw Separators
-        pen_dash = QPen(Qt.gray, 2, Qt.DashLine)
-        painter.setPen(pen_dash)
-        screen_total_h = self.height()
-        screen_a4_h = VIEW_HEIGHT
-        y = screen_a4_h
-        while y < screen_total_h:
-            painter.drawLine(0, y, self.width(), y)
-            y += screen_a4_h
+        for i in range(start_page, end_page + 1):
+            page = self.pages[i]
+            y_pos = i * VIEW_HEIGHT
+            
+            # 1. Draw Page Content
+            if page.is_compressed:
+                painter.drawPixmap(0, y_pos, page.preview_pixmap)
+            else:
+                target_rect = QRect(0, y_pos, VIEW_WIDTH, VIEW_HEIGHT)
+                painter.setRenderHint(QPainter.SmoothPixmapTransform)
+                painter.drawPixmap(target_rect, page.high_res_pixmap, page.high_res_pixmap.rect())
 
-        # Draw Selection Box
+            # 2. Draw Dashed Separator (At the TOP of the page, unless it's the first page)
+            if i > 0:
+                pen_dash = QPen(Qt.gray, 2, Qt.DashLine)
+                painter.setPen(pen_dash)
+                painter.drawLine(0, y_pos, VIEW_WIDTH, y_pos)
+
+        # 3. Draw Tools Overlay
         if self.current_tool == 'select_box' and self.is_selecting:
             pen_sel = QPen(Qt.blue, 2, Qt.DashLine)
             painter.setPen(pen_sel)
             painter.setBrush(Qt.NoBrush)
+            
             screen_start = self.select_start_img / VIEW_SCALE
             screen_curr = self.select_current_img / VIEW_SCALE
             rect = QRect(screen_start, screen_curr).normalized()
             painter.drawRect(rect)
 
-        # Draw Floating Selection
         if self.current_tool == 'moving_selection' and self.floating_pixmap:
             screen_pos = self.floating_pos_img / VIEW_SCALE
             display_float = self.floating_pixmap.scaled(
@@ -321,7 +480,7 @@ class Canvas(QWidget):
 
     def import_pdf(self):
         if not PDF_IMPORT_AVAILABLE:
-            QMessageBox.critical(self, "Error", "pdf2image library not found.\nPlease install: pip install pdf2image\nAnd: sudo apt install poppler-utils")
+            QMessageBox.critical(self, "Error", "pdf2image required.")
             return
         filename, _ = QFileDialog.getOpenFileName(self, "Import PDF", "", "PDF Files (*.pdf)")
         if not filename:
@@ -332,47 +491,43 @@ class Canvas(QWidget):
         try:
             pages = convert_from_path(filename, dpi=200) 
             self.save_state()
-            total_pages = len(pages)
             
-            current_img_h = self.image.height()
-            if current_img_h == IMG_HEIGHT and self.image.toImage().pixel(IMG_WIDTH//2, IMG_HEIGHT//2) == 4294967295:
-                start_y = 0
-                new_total_h = IMG_HEIGHT * total_pages
-            else:
-                start_y = current_img_h
-                new_total_h = start_y + (IMG_HEIGHT * total_pages)
-
-            if new_total_h > current_img_h:
-                new_image = QPixmap(IMG_WIDTH, new_total_h)
-                new_image.fill(Qt.white)
-                painter = QPainter(new_image)
-                painter.drawPixmap(0, 0, self.image)
-            else:
-                new_image = self.image
-                painter = QPainter(new_image)
+            if 0 <= self.active_page_index < len(self.pages):
+                self.pages[self.active_page_index].compress()
 
             for i, page_pil in enumerate(pages):
                 page_pil = page_pil.convert("RGBA")
                 data = page_pil.tobytes("raw", "RGBA")
                 qimg = QImage(data, page_pil.size[0], page_pil.size[1], QImage.Format_RGBA8888)
                 scaled_qimg = qimg.scaledToWidth(IMG_WIDTH, Qt.SmoothTransformation)
-                target_y = start_y + (i * IMG_HEIGHT)
-                painter.drawImage(0, target_y, scaled_qimg)
                 
-            painter.end()
-            self.image = new_image
-            self.setFixedSize(self.image.width() // VIEW_SCALE, self.image.height() // VIEW_SCALE)
+                final_page_pix = QPixmap(IMG_WIDTH, IMG_HEIGHT)
+                final_page_pix.fill(Qt.white)
+                p = QPainter(final_page_pix)
+                p.drawPixmap(0, 0, QPixmap.fromImage(scaled_qimg))
+                p.end()
+                
+                p_obj = Page(final_page_pix)
+                p_obj.compress() # Import as compressed
+                self.pages.append(p_obj)
+            
+            self.active_page_index = len(self.pages) - 1
+            self.pages[self.active_page_index].decompress()
+            
+            self.update_widget_size()
             self.update()
+            
         except Exception as e:
-            QMessageBox.critical(self, "Error", f"Failed to import PDF: {str(e)}")
+            QMessageBox.critical(self, "Error", f"Failed: {str(e)}")
         finally:
             progress.close()
+            gc.collect()
 
     def save_pdf_high_res(self):
         default_name = datetime.now().strftime("%Y-%m-%d") + ".pdf"
         filename, _ = QFileDialog.getSaveFileName(self, "Save PDF", default_name, "PDF Files (*.pdf)")
-        if not filename:
-            return
+        if not filename: return
+        
         printer = QPrinter(QPrinter.HighResolution)
         printer.setOutputFormat(QPrinter.PdfFormat)
         printer.setOutputFileName(filename)
@@ -380,25 +535,23 @@ class Canvas(QWidget):
         
         painter = QPainter(printer)
         printer_rect = printer.pageRect()
-        
-        scale_x = printer_rect.width() / self.image.width()
+        scale_x = printer_rect.width() / IMG_WIDTH
         scale_y = printer_rect.height() / IMG_HEIGHT
-        
         painter.scale(scale_x, scale_y)
         
-        current_y = 0
-        total_height = self.image.height()
-        
-        while current_y < total_height:
-            source_rect = QRect(0, current_y, self.image.width(), IMG_HEIGHT)
-            painter.drawPixmap(0, 0, self.image, source_rect.x(), source_rect.y(), source_rect.width(), source_rect.height())
+        for i, page in enumerate(self.pages):
+            if i > 0: printer.newPage()
             
-            current_y += IMG_HEIGHT
-            if current_y < total_height:
-                printer.newPage()
+            was_compressed = page.is_compressed
+            if was_compressed: page.decompress()
+            
+            painter.drawPixmap(0, 0, page.high_res_pixmap)
+            
+            if was_compressed: page.compress()
                 
         painter.end()
-        QMessageBox.information(self, "Success", f"Saved as {os.path.basename(filename)}")
+        QMessageBox.information(self, "Success", "Saved!")
+        gc.collect()
 
 class NotepadApp(QMainWindow):
     def __init__(self):
@@ -418,14 +571,12 @@ class NotepadApp(QMainWindow):
         sidebar = QVBoxLayout()
         sidebar.setAlignment(Qt.AlignTop)
         
-        # --- TOOLS SECTION ---
         sidebar.addWidget(QLabel("<b>Tools</b>"))
         btn_undo = QPushButton("↶ Undo")
         btn_undo.setStyleSheet("background-color: #ffdddd;")
         btn_undo.clicked.connect(self.canvas.undo)
         sidebar.addWidget(btn_undo)
         
-        # Slider
         sidebar.addWidget(QLabel("Thickness:"))
         slider = QSlider(Qt.Horizontal)
         slider.setMinimum(2)
@@ -457,21 +608,18 @@ class NotepadApp(QMainWindow):
         sidebar.addWidget(btn_eraser)
 
         btn_move = QPushButton("✂ Cut & Move")
-        btn_move.setToolTip("Drag a box to cut, click again to paste")
         btn_move.setStyleSheet("background-color: #e0e0e0;")
         btn_move.clicked.connect(self.canvas.set_move_tool)
         sidebar.addWidget(btn_move)
 
         self.add_separator(sidebar)
 
-        # --- INPUT SECTION ---
         sidebar.addWidget(QLabel("<b>Input</b>"))
         btn_add_page = QPushButton("+ Add A4 Page")
         btn_add_page.clicked.connect(self.canvas.add_page)
         sidebar.addWidget(btn_add_page)
         
         btn_grab = QPushButton("📷 Screen Grab")
-        btn_grab.setToolTip("Hide app and select screen area to copy")
         btn_grab.clicked.connect(self.start_screen_grab)
         sidebar.addWidget(btn_grab)
         
@@ -489,8 +637,13 @@ class NotepadApp(QMainWindow):
 
         self.add_separator(sidebar)
 
-        # --- SYSTEM SECTION ---
         sidebar.addWidget(QLabel("<b>System</b>"))
+        
+        btn_gc = QPushButton("Compact RAM")
+        btn_gc.clicked.connect(lambda: self.canvas.force_gc())
+        btn_gc.setToolTip("Force clean unused memory")
+        sidebar.addWidget(btn_gc)
+
         self.script_disable_path = "./disable_tablet_mode.sh"
         self.script_enable_path = "./enable_tablet_mode.sh"
         
@@ -506,10 +659,6 @@ class NotepadApp(QMainWindow):
         self.btn_pin.setCheckable(True)
         self.btn_pin.clicked.connect(self.toggle_pin)
         sidebar.addWidget(self.btn_pin)
-
-        self.btn_clr = QPushButton("Clear RAM")
-        self.btn_clr.clicked.connect(self.clear_ram)
-        sidebar.addWidget(self.btn_clr)
 
         frame_sidebar = QFrame()
         frame_sidebar.setLayout(sidebar)
@@ -547,15 +696,6 @@ class NotepadApp(QMainWindow):
             self.btn_pin.setText("Pin on Top: OFF")
             self.btn_pin.setStyleSheet("")
             self.show()
-
-    def clear_ram(self):
-        
-        all_objects = gc.get_objects()
-        print(f"Number of tracked objects: {len(all_objects)}")
-        gc.collect()
-        print(f"Number of tracked objects: {len(all_objects)}")
-        uncollectable_objects = gc.garbage
-        print(f"Number of uncollectable objects: {len(uncollectable_objects)}")
 
     def run_script(self, script_path):
         if not os.path.exists(script_path):
