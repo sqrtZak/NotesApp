@@ -1,6 +1,7 @@
 import sys
 import subprocess
 import os
+import gc
 from datetime import datetime
 from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
                              QHBoxLayout, QPushButton, QScrollArea, QColorDialog, 
@@ -506,6 +507,10 @@ class NotepadApp(QMainWindow):
         self.btn_pin.clicked.connect(self.toggle_pin)
         sidebar.addWidget(self.btn_pin)
 
+        self.btn_clr = QPushButton("Clear RAM")
+        self.btn_clr.clicked.connect(self.clear_ram)
+        sidebar.addWidget(self.btn_clr)
+
         frame_sidebar = QFrame()
         frame_sidebar.setLayout(sidebar)
         frame_sidebar.setFixedWidth(170)
@@ -542,6 +547,15 @@ class NotepadApp(QMainWindow):
             self.btn_pin.setText("Pin on Top: OFF")
             self.btn_pin.setStyleSheet("")
             self.show()
+
+    def clear_ram(self):
+        
+        all_objects = gc.get_objects()
+        print(f"Number of tracked objects: {len(all_objects)}")
+        gc.collect()
+        print(f"Number of tracked objects: {len(all_objects)}")
+        uncollectable_objects = gc.garbage
+        print(f"Number of uncollectable objects: {len(uncollectable_objects)}")
 
     def run_script(self, script_path):
         if not os.path.exists(script_path):
