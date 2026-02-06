@@ -177,7 +177,9 @@ class Canvas(QWidget):
         self.setAttribute(Qt.WA_StaticContents)
         self.setMouseTracking(True)
         
-        self.pages = [Page()] 
+        self.pages = []
+        #self.pages = [Page()] 
+        
         self.active_page_index = 0
         
         self.update_widget_size()
@@ -499,8 +501,8 @@ class Canvas(QWidget):
                 page_pil = page_pil.convert("RGBA")
                 data = page_pil.tobytes("raw", "RGBA")
                 qimg = QImage(data, page_pil.size[0], page_pil.size[1], QImage.Format_RGBA8888)
-                scaled_qimg = qimg.scaledToWidth(IMG_WIDTH, Qt.SmoothTransformation)
-                
+                scaled_qimg = qimg.scaledToWidth(IMG_WIDTH, Qt.SmoothTransformation)            
+
                 final_page_pix = QPixmap(IMG_WIDTH, IMG_HEIGHT)
                 final_page_pix.fill(Qt.white)
                 p = QPainter(final_page_pix)
@@ -639,7 +641,7 @@ class NotepadApp(QMainWindow):
 
         sidebar.addWidget(QLabel("<b>System</b>"))
         
-        btn_gc = QPushButton("Compact RAM")
+        btn_gc = QPushButton("⚡ Compact RAM")
         btn_gc.clicked.connect(lambda: self.canvas.force_gc())
         btn_gc.setToolTip("Force clean unused memory")
         sidebar.addWidget(btn_gc)
