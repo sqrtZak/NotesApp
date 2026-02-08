@@ -675,6 +675,26 @@ class NotepadApp(QMainWindow):
         self.scroll_area.setAlignment(Qt.AlignHCenter)
         layout.addWidget(self.scroll_area)
 
+    def should_close(self):
+        reply = QMessageBox.question(self, 'Confirmation', 'Do you want to close?', QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+        if reply == QMessageBox.Yes:
+            return True
+        else:
+            return False
+
+
+    def closeEvent(self, event):
+        if self.should_close():
+            self.on_close()
+            event.accept()
+        else:
+            event.ignore()
+
+    def on_close(self):
+        #We can add here an emergency save?
+        print("Window is closing — protocol executed")
+
+
     def add_separator(self, layout):
         line = QFrame()
         line.setFrameShape(QFrame.HLine)
@@ -715,11 +735,14 @@ class NotepadApp(QMainWindow):
         self.snipper.show()
         
     def finish_screen_grab(self, pixmap):
-        self.showNormal() 
-        if self.pinned:
-            self.setWindowFlags(self.windowFlags() | Qt.WindowStaysOnTopHint)
-            self.show()
-        self.canvas.paste_external_image(pixmap)
+        try:
+            self.showNormal() 
+            if self.pinned:
+                self.setWindowFlags(self.windowFlags() | Qt.WindowStaysOnTopHint)
+                self.show()
+            self.canvas.paste_external_image(pixmap)
+        except Exception as e:
+            print(e)
 
 if __name__ == '__main__':
     app = QApplication(sys.argv)
