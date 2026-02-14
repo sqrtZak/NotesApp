@@ -272,6 +272,9 @@ class Canvas(QWidget):
         self.update_widget_size()
         self.update()
 
+
+        self.auto_save()
+
     def set_pen_color(self, color):
         self.paste_floating_selection()
         self.current_tool = 'pen'
@@ -525,6 +528,34 @@ class Canvas(QWidget):
             progress.close()
             gc.collect()
 
+    def auto_save(self):
+        filename, _ = (os.getcwd()+'/back_up.pdf', 'PDF Files (*.pdf)')
+        if not filename: return
+        
+        printer = QPrinter(QPrinter.HighResolution)
+        printer.setOutputFormat(QPrinter.PdfFormat)
+        printer.setOutputFileName(filename)
+        printer.setPageSize(QPrinter.A4)
+        
+        painter = QPainter(printer)
+        printer_rect = printer.pageRect()
+        scale_x = printer_rect.width() / IMG_WIDTH
+        scale_y = printer_rect.height() / IMG_HEIGHT
+        painter.scale(scale_x, scale_y)
+        
+        for i, page in enumerate(self.pages):
+            if i > 0: printer.newPage()
+            
+            was_compressed = page.is_compressed
+            if was_compressed: page.decompress()
+            
+            painter.drawPixmap(0, 0, page.high_res_pixmap)
+            
+            if was_compressed: page.compress()
+                
+        painter.end()
+        gc.collect()
+
     def save_pdf_high_res(self):
         default_name = datetime.now().strftime("%Y-%m-%d") + ".pdf"
         filename, _ = QFileDialog.getSaveFileName(self, "Save PDF", default_name, "PDF Files (*.pdf)")
@@ -682,7 +713,6 @@ class NotepadApp(QMainWindow):
         else:
             return False
 
-
     def closeEvent(self, event):
         if self.should_close():
             self.on_close()
@@ -727,7 +757,7 @@ class NotepadApp(QMainWindow):
             subprocess.Popen(['/bin/bash', script_path])
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Failed to run script:\n{str(e)}")
-            
+    
     def start_screen_grab(self):
         self.hide()
         self.snipper = SnippingTool()
