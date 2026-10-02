@@ -2,6 +2,7 @@ import sys
 import subprocess
 import os
 import gc
+import traceback
 from datetime import datetime
 from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
                              QHBoxLayout, QPushButton, QScrollArea, QColorDialog, 
@@ -546,7 +547,8 @@ class NotepadApp(QMainWindow):
         btn_grab = QPushButton("📷 Screen Grab"); btn_grab.clicked.connect(self.start_screen_grab); sidebar.addWidget(btn_grab)
         btn_import = QPushButton("Import PDF"); btn_import.clicked.connect(self.canvas.import_pdf); sidebar.addWidget(btn_import)
         btn_pdf = QPushButton("Save PDF"); btn_pdf.clicked.connect(self.canvas.save_pdf_high_res); sidebar.addWidget(btn_pdf)
-        btn_clear = QPushButton("Reset / Clear"); btn_clear.clicked.connect(self.canvas.reset_to_a4); sidebar.addWidget(btn_clear)
+        
+        btn_clear = QPushButton("Reset / Clear"); btn_clear.clicked.connect(self.confirm_reset); sidebar.addWidget(btn_clear)
 
         self.add_separator(sidebar); sidebar.addWidget(QLabel("<b>View</b>"))
         self.btn_zoom_mode = QPushButton("Zoom Mode: OFF")
@@ -586,6 +588,10 @@ class NotepadApp(QMainWindow):
         self.btn_zoom_mode.setStyleSheet("background-color: #aaffaa" if is_checked else "")
         self.canvas.set_zoom_mode(is_checked)
 
+    def confirm_reset(self):
+        if QMessageBox.question(self, 'Confirmation', 'Are you sure you want to reset and clear all pages?', QMessageBox.Yes | QMessageBox.No, QMessageBox.No) == QMessageBox.Yes:
+            self.canvas.reset_to_a4()
+
     def should_close(self):
         return QMessageBox.question(self, 'Confirmation', 'Do you want to close?', QMessageBox.Yes | QMessageBox.No, QMessageBox.No) == QMessageBox.Yes
 
@@ -621,4 +627,37 @@ class NotepadApp(QMainWindow):
         self.showNormal(); self.canvas.paste_external_image(pixmap)
 
 if __name__ == '__main__':
-    app = QApplication(sys.argv); window = NotepadApp(); window.show(); sys.exit(app.exec_())
+    app = QApplication(sys.argv)
+    window = NotepadApp()
+    
+    # --- GLOBAL CRASH HANDLER ---
+    def crash_handler(exc_type, exc_value, exc_traceback):
+        crash_time = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+        
+        # 1. Save the crash report text file
+        try:
+            crash_filename = f"crash_report_{crash_time}.txt"
+            with open(crash_filename, "w") as f:
+                f.write(f"Crash Report - {crash_time}\n")
+                f.write("="*40 + "\n")
+                traceback.print_exception(exc_type, exc_value, exc_traceback, file=f)
+            print(f"App crashed! Crash report saved to {crash_filename}")
+        except Exception as e:
+            print(f"Failed to write crash report: {e}")
+            
+        # 2. Save the backup PDF of the current pages
+        try:
+            backup_pdf = os.path.join(os.getcwd(), f"crash_backup_{crash_time}.pdf")
+            window.canvas.save_pdf_engine(backup_pdf, show_msg=False)
+            print(f"Backup PDF saved to {backup_pdf}")
+        except Exception as e:
+            print(f"Failed to save backup PDF during crash: {e}")
+            
+        # 3. Call the default system exception handler to actually terminate the app
+        sys.__excepthook__(exc_type, exc_value, exc_traceback)
+
+    # Register the custom crash handler
+    sys.excepthook = crash_handler
+    
+    window.show()
+    sys.exit(app.exec_())
