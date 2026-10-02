@@ -140,11 +140,17 @@ class Canvas(QWidget):
         self.last_point_img = QPoint() 
         self.current_tool = 'pen' 
         self.brush_size = 8 
-        self.text_size = 24  # New text size variable
+        self.text_size = 24  
         self.brush_color = Qt.black
         self.is_selecting = False       
         self.floating_pixmap = None     
-        self.floating_pos_img = QPoint()    
+        self.floating_pos_img = QPoint()
+        
+        # CONTINUOUS DRAW VARIABLES
+        self.continuous_draw = False    
+        self.jump_threshold = 300       
+        self.last_ignored_point = None  
+        self.ignored_count = 0          
 
     def update_widget_size(self):
         self.setFixedSize(int(VIEW_WIDTH * self.zoom_factor), int(len(self.pages) * VIEW_HEIGHT * self.zoom_factor))
@@ -158,7 +164,9 @@ class Canvas(QWidget):
 
     def set_brush_size(self, size): self.brush_size = size
     
-    def set_text_size(self, size): self.text_size = size # New setter
+    def set_text_size(self, size): self.text_size = size 
+
+    def set_continuous_draw(self, enabled): self.continuous_draw = enabled 
 
     def force_gc(self):
         gc.collect()
@@ -250,7 +258,7 @@ class Canvas(QWidget):
         self.paste_floating_selection(); self.current_tool = 'select_box'
         if not self.zoom_mode: self.setCursor(Qt.CrossCursor)
 
-    def set_text_tool(self): # New tool initializer
+    def set_text_tool(self): 
         self.paste_floating_selection(); self.current_tool = 'text'
         if not self.zoom_mode: self.setCursor(Qt.IBeamCursor)
 
@@ -297,7 +305,7 @@ class Canvas(QWidget):
                 self.pages[self.active_page_index].compress()
                 self.pages[page_idx].decompress(); self.active_page_index = page_idx; self.update()
 
-            if self.current_tool == 'text': # Logic for typing
+            if self.current_tool == 'text': 
                 text, ok = QInputDialog.getMultiLineText(self, "Insert Text", "Type text to place at cursor:")
                 if ok and text:
                     self.save_state()
@@ -312,7 +320,11 @@ class Canvas(QWidget):
             elif self.current_tool == 'moving_selection':
                 self.paste_floating_selection(); self.current_tool = 'select_box' 
             elif self.current_tool in ['pen', 'eraser']:
-                self.save_state(); self.drawing = True; self.last_point_img = global_pos
+                self.save_state()
+                self.drawing = True
+                self.last_point_img = global_pos
+                self.last_ignored_point = None
+                self.ignored_count = 0
 
     def mouseMoveEvent(self, event):
         if self.zoom_mode:
@@ -331,10 +343,53 @@ class Canvas(QWidget):
         if self.current_tool == 'moving_selection' and self.floating_pixmap:
             self.floating_pos_img = global_pos - QPoint(self.floating_pixmap.width() // 2, self.floating_pixmap.height() // 2)
             self.update(); return
+            
         if (event.buttons() & Qt.LeftButton):
-            if self.current_tool == 'select_box' and self.is_selecting:
-                self.select_current_img = global_pos; self.update() 
-            elif self.current_tool in ['pen', 'eraser'] and self.drawing:
+            if self.current_tool == 'select_box':
+                # Auto-recover selection if OS missed the press event
+                if not self.is_selecting:
+                    self.is_selecting = True
+                    self.select_start_img = global_pos
+                self.select_current_img = global_pos
+                self.update() 
+                
+            elif self.current_tool in ['pen', 'eraser']:
+                # Auto-recover drawing if OS missed the press event (e.g. after keyboard closes)
+                if not self.drawing:
+                    self.save_state()
+                    self.drawing = True
+                    self.last_point_img = global_pos
+                    self.last_ignored_point = None
+                    self.ignored_count = 0
+                    return # Skip drawing this frame to prevent a jump line
+                
+                if self.continuous_draw:
+                    dx = global_pos.x() - self.last_point_img.x()
+                    dy = global_pos.y() - self.last_point_img.y()
+                    dist = (dx**2 + dy**2)**0.5
+                    
+                    if dist > self.jump_threshold:
+                        if self.last_ignored_point:
+                            idx = global_pos.x() - self.last_ignored_point.x()
+                            idy = global_pos.y() - self.last_ignored_point.y()
+                            if (idx**2 + idy**2)**0.5 < 100:
+                                self.ignored_count += 1
+                                if self.ignored_count > 5:
+                                    # Jump accepted as a new valid starting point
+                                    self.last_point_img = global_pos
+                                    self.ignored_count = 0
+                                    return # Return here so it doesn't draw a line connecting the jump
+                            else:
+                                self.last_ignored_point = global_pos
+                                self.ignored_count = 1
+                        else:
+                            self.last_ignored_point = global_pos
+                            self.ignored_count = 1
+                        return 
+                    else:
+                        self.ignored_count = 0
+                        self.last_ignored_point = None
+                
                 page_idx, local_y = self.get_page_at(global_pos.y())
                 if page_idx == self.active_page_index:
                     page = self.pages[page_idx]
@@ -372,6 +427,8 @@ class Canvas(QWidget):
                         self.update()
             elif self.current_tool in ['pen', 'eraser']:
                 self.drawing = False
+                self.last_ignored_point = None
+                self.ignored_count = 0
                 if 0 <= self.active_page_index < len(self.pages):
                      self.pages[self.active_page_index].preview_pixmap = self.pages[self.active_page_index].high_res_pixmap.scaled(VIEW_WIDTH, VIEW_HEIGHT, Qt.KeepAspectRatio, Qt.SmoothTransformation)
 
@@ -429,7 +486,7 @@ class Canvas(QWidget):
         filename, _ = QFileDialog.getSaveFileName(self, "Save PDF", datetime.now().strftime("%Y-%m-%d") + ".pdf", "PDF Files (*.pdf)")
         if filename: self.save_pdf_engine(filename, show_msg=True)
 
-    def save_pdf_engine(self, filename, show_msg=True): # Optimized Lossless PDF Engine
+    def save_pdf_engine(self, filename, show_msg=True): 
         printer = QPrinter(QPrinter.HighResolution)
         printer.setOutputFormat(QPrinter.PdfFormat); printer.setOutputFileName(filename)
         printer.setPageSize(QPrinter.A4); printer.setFullPage(True)
@@ -438,7 +495,6 @@ class Canvas(QWidget):
             if i > 0: printer.newPage()
             was_c = page.is_compressed
             if was_c: page.decompress()
-            # Converting to QImage triggers lossless Flate compression in the PDF engine
             painter.drawImage(rect, page.high_res_pixmap.toImage())
             if was_c: page.compress()
         painter.end(); gc.collect()
@@ -463,7 +519,6 @@ class NotepadApp(QMainWindow):
         slider = QSlider(Qt.Horizontal); slider.setRange(2, 60); slider.setValue(8)
         slider.valueChanged.connect(self.canvas.set_brush_size); sidebar.addWidget(slider)
 
-        # TEXT TOOL ROW
         text_row = QHBoxLayout()
         btn_type = QPushButton("Type")
         btn_type.clicked.connect(self.canvas.set_text_tool)
@@ -479,6 +534,12 @@ class NotepadApp(QMainWindow):
         btn_color = QPushButton("Pick Color..."); btn_color.clicked.connect(self.choose_color); sidebar.addWidget(btn_color)
         btn_eraser = QPushButton("Eraser"); btn_eraser.clicked.connect(self.canvas.set_eraser); sidebar.addWidget(btn_eraser)
         btn_move = QPushButton("✂ Cut & Move"); btn_move.setStyleSheet("background-color: #e0e0e0;"); btn_move.clicked.connect(self.canvas.set_move_tool); sidebar.addWidget(btn_move)
+
+        # CONTINUOUS DRAW BUTTON
+        self.btn_continuous = QPushButton("Continuous Draw: OFF")
+        self.btn_continuous.setCheckable(True)
+        self.btn_continuous.clicked.connect(self.toggle_continuous_draw)
+        sidebar.addWidget(self.btn_continuous)
 
         self.add_separator(sidebar); sidebar.addWidget(QLabel("<b>Input</b>"))
         btn_add_page = QPushButton("+ Add A4 Page"); btn_add_page.clicked.connect(self.canvas.add_page); sidebar.addWidget(btn_add_page)
@@ -512,6 +573,12 @@ class NotepadApp(QMainWindow):
         self.scroll_area = QScrollArea(); self.scroll_area.setBackgroundRole(QPalette.Dark); self.scroll_area.setStyleSheet("background-color: #ccc;") 
         self.scroll_area.setWidget(self.canvas); self.scroll_area.setWidgetResizable(True); self.scroll_area.setAlignment(Qt.AlignHCenter); layout.addWidget(self.scroll_area)
         self.canvas.scroll_area = self.scroll_area
+
+    def toggle_continuous_draw(self):
+        is_checked = self.btn_continuous.isChecked()
+        self.btn_continuous.setText(f"Continuous Draw: {'ON' if is_checked else 'OFF'}")
+        self.btn_continuous.setStyleSheet("background-color: #aaffaa" if is_checked else "")
+        self.canvas.set_continuous_draw(is_checked)
 
     def toggle_zoom_mode(self):
         is_checked = self.btn_zoom_mode.isChecked()
