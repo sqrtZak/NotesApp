@@ -33,8 +33,12 @@ class Page:
         if pixmap:
             self.high_res_pixmap = pixmap
         else:
-            self.high_res_pixmap = QPixmap(IMG_WIDTH, IMG_HEIGHT)
-            self.high_res_pixmap.fill(Qt.white)
+            # FIX: Create via QImage (Format_RGB32) to ensure a highly optimized 
+            # 32-bit format. Raw QPixmap(w, h) uses the system default depth, 
+            # which causes severe lag during rapid QPainter updates.
+            img = QImage(IMG_WIDTH, IMG_HEIGHT, QImage.Format_RGB32)
+            img.fill(Qt.white)
+            self.high_res_pixmap = QPixmap.fromImage(img)
             
         self.compressed_data = None
         self.preview_pixmap = self.high_res_pixmap.scaled(
