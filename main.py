@@ -9,7 +9,7 @@ from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                              QLabel, QMessageBox, QFrame, QFileDialog, QProgressDialog,
                              QSlider, QInputDialog) 
 from PyQt5.QtGui import QPainter, QPen, QPixmap, QPalette, QColor, QCursor, QIcon, QImage, QFont
-from PyQt5.QtCore import Qt, QPoint, QRect, QSize, pyqtSignal, QBuffer, QByteArray, QIODevice
+from PyQt5.QtCore import Qt, QPoint, QRect, QSize, pyqtSignal, QBuffer, QByteArray, QIODevice, QThread, QTimer
 from PyQt5.QtPrintSupport import QPrinter
 
 # --- OPTIONAL IMPORTS ---
@@ -122,6 +122,40 @@ class SnippingTool(QWidget):
     def keyPressEvent(self, event):
         if event.key() == Qt.Key_Escape: self.close()
 
+# --- BACKGROUND AUTO-SAVE THREAD ---
+class AutoSaveThread(QThread):
+    def __init__(self, pages_data, filename):
+        super().__init__()
+        self.pages_data = pages_data
+        self.filename = filename
+
+    def run(self):
+        try:
+            printer = QPrinter(QPrinter.HighResolution)
+            printer.setOutputFormat(QPrinter.PdfFormat)
+            printer.setOutputFileName(self.filename)
+            printer.setPageSize(QPrinter.A4)
+            printer.setFullPage(True)
+            
+            painter = QPainter(printer)
+            rect = printer.pageRect()
+            
+            for i, p_data in enumerate(self.pages_data):
+                if i > 0:
+                    printer.newPage()
+                
+                # If it's compressed bytes, load it directly. Otherwise, it's already a QImage.
+                if isinstance(p_data, bytes) or isinstance(p_data, bytearray):
+                    img = QImage.fromData(p_data, "PNG")
+                else:
+                    img = p_data
+                    
+                painter.drawImage(rect, img)
+                
+            painter.end()
+        except Exception as e:
+            print(f"Background auto-save failed: {e}")
+
 class Canvas(QWidget):
     def __init__(self, parent=None):
         super().__init__() 
@@ -153,6 +187,33 @@ class Canvas(QWidget):
         self.last_ignored_point = None  
         self.ignored_count = 0          
 
+        # START AUTO SAVE TIMER
+        self.start_auto_save_timer()
+
+    def start_auto_save_timer(self):
+        self.auto_save_timer = QTimer(self)
+        self.auto_save_timer.timeout.connect(self.background_auto_save)
+        self.auto_save_timer.start(300000) # 300,000 ms = 5 minutes
+
+    def background_auto_save(self):
+        # Prevent starting a new save if the previous one is still running
+        if hasattr(self, 'save_thread') and self.save_thread.isRunning():
+            return
+            
+        filename = os.path.join(os.getcwd(), 'back_up.pdf')
+        
+        # Gather data safely in the main thread
+        pages_data = []
+        for page in self.pages:
+            if page.is_compressed:
+                pages_data.append(page.compressed_data)
+            else:
+                # Convert QPixmap to QImage in main thread (Thread-safe for the worker)
+                pages_data.append(page.high_res_pixmap.toImage())
+                
+        # Pass the data to the background thread
+        self.save_thread = AutoSaveThread(pages_data, filename)
+        self.save_thread.start()
 
     def set_resolution_scale(self, scale_factor):
         self.paste_floating_selection()
@@ -514,8 +575,7 @@ class Canvas(QWidget):
         finally: progress.close(); gc.collect()
 
     def auto_save(self):
-        filename = os.getcwd() + '/back_up.pdf'
-        self.save_pdf_engine(filename, show_msg=False)
+        self.background_auto_save()
 
     def save_pdf_high_res(self):
         filename, _ = QFileDialog.getSaveFileName(self, "Save PDF", datetime.now().strftime("%Y-%m-%d") + ".pdf", "PDF Files (*.pdf)")
