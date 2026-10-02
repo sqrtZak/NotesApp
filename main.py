@@ -153,6 +153,40 @@ class Canvas(QWidget):
         self.last_ignored_point = None  
         self.ignored_count = 0          
 
+
+    def set_resolution_scale(self, scale_factor):
+        self.paste_floating_selection()
+        global IMG_WIDTH, IMG_HEIGHT, VIEW_WIDTH, VIEW_HEIGHT
+        
+        new_img_width = int(1588 * scale_factor)
+        new_img_height = int(2246 * scale_factor)
+        
+        if new_img_width == IMG_WIDTH and new_img_height == IMG_HEIGHT:
+            return
+            
+        IMG_WIDTH = new_img_width
+        IMG_HEIGHT = new_img_height
+        VIEW_WIDTH = IMG_WIDTH // VIEW_SCALE
+        VIEW_HEIGHT = IMG_HEIGHT // VIEW_SCALE
+        
+        for page in self.pages:
+            was_compressed = page.is_compressed
+            if was_compressed: page.decompress()
+            page.high_res_pixmap = page.high_res_pixmap.scaled(IMG_WIDTH, IMG_HEIGHT, Qt.IgnoreAspectRatio, Qt.SmoothTransformation)
+            page.preview_pixmap = page.high_res_pixmap.scaled(VIEW_WIDTH, VIEW_HEIGHT, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+            if was_compressed: page.compress()
+                
+        for stack in self.undo_stack:
+            for page in stack:
+                was_compressed = page.is_compressed
+                if was_compressed: page.decompress()
+                page.high_res_pixmap = page.high_res_pixmap.scaled(IMG_WIDTH, IMG_HEIGHT, Qt.IgnoreAspectRatio, Qt.SmoothTransformation)
+                page.preview_pixmap = page.high_res_pixmap.scaled(VIEW_WIDTH, VIEW_HEIGHT, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+                if was_compressed: page.compress()
+        
+        self.update_widget_size()
+        self.update()
+
     def update_widget_size(self):
         self.setFixedSize(int(VIEW_WIDTH * self.zoom_factor), int(len(self.pages) * VIEW_HEIGHT * self.zoom_factor))
 
@@ -550,6 +584,35 @@ class NotepadApp(QMainWindow):
         
         btn_clear = QPushButton("Reset / Clear"); btn_clear.clicked.connect(self.confirm_reset); sidebar.addWidget(btn_clear)
 
+        
+        self.add_separator(sidebar); sidebar.addWidget(QLabel("<b>Resolution</b>"))
+        
+        res_layout = QHBoxLayout()
+        self.res_slider = QSlider(Qt.Horizontal)
+        self.res_slider.setRange(50, 300)
+        self.res_slider.setValue(100)
+        
+        self.res_label = QLabel("1588 x 2246")
+        res_layout.addWidget(self.res_slider)
+        res_layout.addWidget(self.res_label)
+        sidebar.addLayout(res_layout)
+        
+        btn_res_layout = QHBoxLayout()
+        btn_res_std = QPushButton("Standard")
+        btn_res_med = QPushButton("Medium")
+        btn_res_high = QPushButton("High")
+        btn_res_layout.addWidget(btn_res_std)
+        btn_res_layout.addWidget(btn_res_med)
+        btn_res_layout.addWidget(btn_res_high)
+        sidebar.addLayout(btn_res_layout)
+        
+        self.res_slider.valueChanged.connect(self.on_res_slider_changed)
+        self.res_slider.sliderReleased.connect(self.apply_resolution)
+        
+        btn_res_std.clicked.connect(lambda: self.set_resolution_preset(100))
+        btn_res_med.clicked.connect(lambda: self.set_resolution_preset(150))
+        btn_res_high.clicked.connect(lambda: self.set_resolution_preset(200))
+
         self.add_separator(sidebar); sidebar.addWidget(QLabel("<b>View</b>"))
         self.btn_zoom_mode = QPushButton("Zoom Mode: OFF")
         self.btn_zoom_mode.setCheckable(True)
@@ -571,10 +634,24 @@ class NotepadApp(QMainWindow):
         btn_en_tab = QPushButton("Enable Tablet Mode"); btn_en_tab.clicked.connect(lambda: self.run_script(self.script_enable_path)); sidebar.addWidget(btn_en_tab)
         self.btn_pin = QPushButton("Pin on Top: OFF"); self.btn_pin.setCheckable(True); self.btn_pin.clicked.connect(self.toggle_pin); sidebar.addWidget(self.btn_pin)
 
-        frame_sidebar = QFrame(); frame_sidebar.setLayout(sidebar); frame_sidebar.setFixedWidth(175); layout.addWidget(frame_sidebar)
+        frame_sidebar = QFrame(); frame_sidebar.setLayout(sidebar); frame_sidebar.setFixedWidth(220); layout.addWidget(frame_sidebar)
         self.scroll_area = QScrollArea(); self.scroll_area.setBackgroundRole(QPalette.Dark); self.scroll_area.setStyleSheet("background-color: #ccc;") 
         self.scroll_area.setWidget(self.canvas); self.scroll_area.setWidgetResizable(True); self.scroll_area.setAlignment(Qt.AlignHCenter); layout.addWidget(self.scroll_area)
         self.canvas.scroll_area = self.scroll_area
+
+
+    def on_res_slider_changed(self, value):
+        w = int(1588 * (value / 100.0))
+        h = int(2246 * (value / 100.0))
+        self.res_label.setText(f"{w} x {h}")
+
+    def apply_resolution(self):
+        value = self.res_slider.value()
+        self.canvas.set_resolution_scale(value / 100.0)
+
+    def set_resolution_preset(self, value):
+        self.res_slider.setValue(value)
+        self.apply_resolution()
 
     def toggle_continuous_draw(self):
         is_checked = self.btn_continuous.isChecked()
